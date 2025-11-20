@@ -16,7 +16,4 @@ router.get('/tickets', authenticateToken, requireRole(['support_agent', 'senior_
 // Vendor routes (read-only complaints)
 router.get('/complaints/restaurant', authenticateToken, requireRole(['vendor']), supportController.getRestaurantComplaints);
 
-// Debug route - return ticket, messages, and any restaurant_complaints rows (protected)
-router.get('/debug/ticket/:ticket_id', authenticateToken, supportController.debugTicket);
-
 module.exports = router;
