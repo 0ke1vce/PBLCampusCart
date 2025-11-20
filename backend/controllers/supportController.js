@@ -8,17 +8,29 @@ const supportController = {
             const userId = req.user.user_id;
             const { order_id, restaurant_id, ticket_type, subject, description, priority } = req.body;
 
-            console.log('📋 Creating support ticket:', { userId, ticket_type, subject });
+            console.log('🔖 Creating support ticket:', { userId, ticket_type, subject, order_id, restaurant_id });
 
             // Validate required fields
             if (!ticket_type || !subject || !description) {
                 return res.status(400).json({ error: 'Missing required fields' });
             }
 
+            // If order_id provided, get restaurant_id from order
+            let finalRestaurantId = restaurant_id;
+            if (order_id && !restaurant_id) {
+                const [orders] = await pool.execute(
+                    'SELECT restaurant_id FROM orders WHERE order_id = ? AND student_id = ?',
+                    [order_id, userId]
+                );
+                if (orders.length > 0) {
+                    finalRestaurantId = orders[0].restaurant_id;
+                }
+            }
+
             const [result] = await pool.execute(
                 `INSERT INTO support_tickets (user_id, order_id, restaurant_id, ticket_type, subject, description, priority)
                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [userId, order_id || null, restaurant_id || null, ticket_type, subject, description, priority || 'medium']
+                [userId, order_id || null, finalRestaurantId || null, ticket_type, subject, description, priority || 'medium']
             );
 
             const ticketId = result.insertId;
@@ -46,47 +58,27 @@ const supportController = {
                 [ticketId, description, aiResponse.message, aiResponse.intent, aiResponse.confidence, aiResponse.needsHuman]
             );
 
+            // 🔥 KEY FIX: Create restaurant complaint record if restaurant_id exists
+            if (finalRestaurantId) {
+                try {
+                    await pool.execute(
+                        `INSERT INTO restaurant_complaints (ticket_id, restaurant_id, complaint_type, order_id, complaint_summary, resolution_status)
+                         VALUES (?, ?, ?, ?, ?, ?)`,
+                        [ticketId, finalRestaurantId, ticket_type, order_id || null, subject, 'open']
+                    );
+                    console.log('✅ Restaurant complaint record created for ticket:', ticketId, 'restaurant:', finalRestaurantId);
+                } catch (error) {
+                    console.error('⚠️ Warning: Could not create restaurant complaint record:', error.message);
+                    // Don't fail if restaurant_complaints creation fails
+                }
+            }
+
             // Auto-escalate if needed
             if (aiResponse.needsHuman || priority === 'urgent') {
                 await supportController.escalateToHuman(ticketId, 'Auto-escalation: ' + (aiResponse.needsHuman ? 'AI confidence low' : 'Urgent priority'));
             }
 
-            // If this ticket is related to a restaurant, create a restaurant_complaints entry
-            try {
-                let effectiveRestaurantId = restaurant_id;
-
-                // If restaurant_id not provided but order_id exists, try to infer restaurant_id from the order
-                if (!effectiveRestaurantId && order_id) {
-                    try {
-                        const [orders] = await pool.execute(
-                            'SELECT restaurant_id FROM orders WHERE order_id = ? LIMIT 1',
-                            [order_id]
-                        );
-                        if (orders.length > 0) {
-                            effectiveRestaurantId = orders[0].restaurant_id;
-                            console.log('🔎 Inferred restaurant_id from order:', effectiveRestaurantId);
-                        }
-                    } catch (inferErr) {
-                        console.error('❌ Failed to infer restaurant_id from order:', inferErr.message);
-                    }
-                }
-
-                if (effectiveRestaurantId) {
-                    await pool.execute(
-                        `INSERT INTO restaurant_complaints (ticket_id, restaurant_id, complaint_type, complaint_summary)
-                         VALUES (?, ?, ?, ?)`,
-                        [ticketId, effectiveRestaurantId, ticket_type, subject || description || null]
-                    );
-                    console.log('📣 Restaurant complaint recorded for restaurant:', effectiveRestaurantId, 'ticket:', ticketId);
-                } else {
-                    console.log('ℹ️ No restaurant association for ticket', ticketId, '— skipping restaurant_complaints insert');
-                }
-            } catch (rcErr) {
-                console.error('❌ Failed to create restaurant_complaints entry:', rcErr.message);
-                // don't fail the ticket creation if this secondary insert fails
-            }
-
-            console.log('✅ Ticket created:', ticketId);
+            console.log('✅ Ticket created successfully:', ticketId);
 
             res.status(201).json({
                 message: 'Support ticket created successfully',
@@ -292,26 +284,33 @@ const supportController = {
         }
     },
 
-    // Get restaurant complaints (Vendor)
+    // Get restaurant complaints (Vendor) - FIXED VERSION
     getRestaurantComplaints: async (req, res) => {
         try {
             const vendorId = req.user.user_id;
+            console.log('🔍 Fetching complaints for vendor:', vendorId);
 
             const [complaints] = await pool.execute(
                 `SELECT 
                     rc.*,
                     st.priority,
                     st.status,
-                    st.created_at as ticket_created_at
+                    st.created_at as ticket_created_at,
+                    u.full_name as customer_name,
+                    u.email as customer_email,
+                    u.phone as customer_phone,
+                    r.restaurant_name
                 FROM restaurant_complaints rc
                 JOIN support_tickets st ON rc.ticket_id = st.ticket_id
                 JOIN restaurants r ON rc.restaurant_id = r.restaurant_id
+                JOIN users u ON st.user_id = u.user_id
                 WHERE r.vendor_id = ?
                 ORDER BY rc.created_at DESC
-                LIMIT 50`,
+                LIMIT 100`,
                 [vendorId]
             );
 
+            console.log('✅ Found', complaints.length, 'complaints for vendor', vendorId);
             res.json({ complaints });
 
         } catch (error) {
@@ -319,48 +318,8 @@ const supportController = {
             res.status(500).json({ error: 'Failed to get complaints' });
         }
     },
-    
-    // DEBUG: return ticket, chat messages and restaurant_complaints for a given ticket
-    debugTicket: async (req, res) => {
-        try {
-            const { ticket_id } = req.params;
 
-            const [tickets] = await pool.execute(
-                `SELECT st.*, u.full_name as customer_name, r.restaurant_name
-                 FROM support_tickets st
-                 LEFT JOIN users u ON st.user_id = u.user_id
-                 LEFT JOIN restaurants r ON st.restaurant_id = r.restaurant_id
-                 WHERE st.ticket_id = ?`,
-                [ticket_id]
-            );
-
-            if (tickets.length === 0) {
-                return res.status(404).json({ error: 'Ticket not found' });
-            }
-
-            const ticket = tickets[0];
-
-            const [messages] = await pool.execute(
-                `SELECT cm.*, u.full_name as sender_name, u.user_type as sender_role
-                 FROM chat_messages cm
-                 LEFT JOIN users u ON cm.sender_id = u.user_id
-                 WHERE cm.ticket_id = ? ORDER BY cm.created_at ASC`,
-                [ticket_id]
-            );
-
-            const [complaints] = await pool.execute(
-                `SELECT * FROM restaurant_complaints WHERE ticket_id = ?`,
-                [ticket_id]
-            );
-
-            res.json({ ticket, messages, restaurant_complaints: complaints });
-        } catch (error) {
-            console.error('❌ Debug ticket error:', error.message);
-            res.status(500).json({ error: 'Failed to debug ticket', details: error.message });
-        }
-    },
-
-    // Additional helper methods...
+    // Get all tickets (for support agents)
     getAllTickets: async (req, res) => {
         try {
             const { status, priority } = req.query;
